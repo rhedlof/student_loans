@@ -41,12 +41,29 @@ def generate_avalanche_plot(
     elif df["Est. Interest Rate"].max() > 1.0:
         df["Est. Interest Rate"] = df["Est. Interest Rate"] / 100.0
 
+    # Calculate a fallback minimum payment estimate (10-yr amortization)
+    # for every loan, used to fill in the column when it's absent AND
+    # to patch any individual blank/NaN cells in an existing column.
+    # Leaving a NaN in "Minimum Payment" is dangerous: Python's min()
+    # silently returns the non-NaN operand depending on argument order,
+    # which can zero out balances unexpectedly during the simulation.
+    r = df["Est. Interest Rate"] / 12.0
+    n = 120
+    estimated_minimum_payment = (
+        df["Current Balance"] * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+    )
+
     if "Minimum Payment" not in df.columns:
-        r = df["Est. Interest Rate"] / 12.0
-        n = 120
-        df["Minimum Payment"] = (
-            df["Current Balance"] * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+        df["Minimum Payment"] = estimated_minimum_payment
+    else:
+        df["Minimum Payment"] = pd.to_numeric(
+            df["Minimum Payment"], errors="coerce"
         )
+        missing_mask = df["Minimum Payment"].isna()
+        if missing_mask.any():
+            df.loc[missing_mask, "Minimum Payment"] = estimated_minimum_payment[
+                missing_mask
+            ]
 
     all_loans_raw = df.to_dict("records")
 
@@ -104,14 +121,20 @@ def generate_avalanche_plot(
                 l["Current Balance"] += interest_accrued
                 total_interest_paid += interest_accrued
 
-        # Minimum payments
+        # Minimum payments — any minimum payment freed up by an
+        # already-paid-off loan gets rolled into the extra pool below,
+        # which is what makes this a "true" debt avalanche (minimums
+        # from retired loans snowball onto the next target debt).
+        freed_minimum_payments = 0.0
         for l in loans:
             if l["Current Balance"] > 0:
                 pmt = min(l["Current Balance"], l["Minimum Payment"])
                 l["Current Balance"] -= pmt
+            else:
+                freed_minimum_payments += l["Minimum Payment"]
 
         # Target extra payment
-        extra_pool = extra_monthly_budget
+        extra_pool = extra_monthly_budget + freed_minimum_payments
         if strategy.lower() == "hybrid":
             active_priv = sorted(
                 [
