@@ -100,6 +100,7 @@ def generate_avalanche_plot(
     history = []
     individual_payoff_months = {}
     total_interest_paid = 0.0
+    focus_payment_history = []
 
     while month < 360:
         total_bal = sum(l["Current Balance"] for l in loans)
@@ -126,10 +127,12 @@ def generate_avalanche_plot(
         # which is what makes this a "true" debt avalanche (minimums
         # from retired loans snowball onto the next target debt).
         freed_minimum_payments = 0.0
+        minimum_paid_this_month = {}
         for l in loans:
             if l["Current Balance"] > 0:
                 pmt = min(l["Current Balance"], l["Minimum Payment"])
                 l["Current Balance"] -= pmt
+                minimum_paid_this_month[l["Loan Name"]] = pmt
             else:
                 freed_minimum_payments += l["Minimum Payment"]
 
@@ -164,6 +167,12 @@ def generate_avalanche_plot(
                 reverse=True,
             )
 
+        # The "focus" loan is whichever active loan sits at the top of
+        # this month's priority order — the one all extra dollars get
+        # aimed at first.
+        focus_name = target_list[0]["Loan Name"] if target_list else None
+
+        extra_paid_this_month = {}
         for l in target_list:
             if extra_pool <= 0:
                 break
@@ -171,6 +180,19 @@ def generate_avalanche_plot(
                 extra_pmt = min(l["Current Balance"], extra_pool)
                 l["Current Balance"] -= extra_pmt
                 extra_pool -= extra_pmt
+                extra_paid_this_month[l["Loan Name"]] = extra_pmt
+
+        if focus_name is not None:
+            focus_total_payment = minimum_paid_this_month.get(
+                focus_name, 0.0
+            ) + extra_paid_this_month.get(focus_name, 0.0)
+            focus_payment_history.append(
+                {
+                    "Month": month,
+                    "Loan Name": focus_name,
+                    "Payment": focus_total_payment,
+                }
+            )
 
         for l in loans:
             name = l["Loan Name"]
@@ -198,19 +220,24 @@ def generate_avalanche_plot(
     # ----------------------------------------------------
     # 3. PLOT GRAPH
     # ----------------------------------------------------
-    loan_names = [l["Loan Name"] for l in loans]
+    # Stack loans in payoff-priority order (rank #1 sits right on the
+    # x-axis, rank #N forms the outer edge) instead of raw spreadsheet
+    # row order. This makes each band collapse to the axis in the same
+    # sequence money is actually applied, so the chart reads left-to-
+    # right AND bottom-to-top as a payoff cascade, and the stacking
+    # order now matches the legend order below.
+    loan_names = [
+        name
+        for name, _rank in sorted(priority_map.items(), key=lambda kv: kv[1])
+    ]
     num_loans = len(loan_names)
 
-    rates = [
-        next(l for l in all_loans_raw if l["Loan Name"] == name)[
-            "Est. Interest Rate"
-        ]
-        * 100.0
-        for name in loan_names
-    ]
-    norm = mcolors.Normalize(vmin=min(rates), vmax=max(rates))
-    colormap = cm.YlOrRd
-    get_loan_color = lambda name, rate: colormap(norm(rate))
+    # Color by priority rank (not raw interest rate) so the gradient is
+    # always a clean "paid first -> paid last" ramp, including under the
+    # hybrid strategy where rank and rate can diverge.
+    norm = mcolors.Normalize(vmin=1, vmax=num_loans)
+    colormap = cm.YlOrRd_r
+    get_loan_color = lambda name: colormap(norm(priority_map[name]))
 
     fig, ax = plt.subplots(figsize=(14, 8))
 
@@ -232,7 +259,7 @@ def generate_avalanche_plot(
         rank = priority_map[name]
         payoff_date_text = individual_payoff_dates.get(name, "N/A")
 
-        curve_color = get_loan_color(name, rate_pct)
+        curve_color = get_loan_color(name)
         label_text = (
             f"#{rank}: {name} ({rate_pct:.2f}%) — Paid: {payoff_date_text}"
         )
@@ -294,6 +321,64 @@ def generate_avalanche_plot(
     output_filename = "avalanche_payoff_chart.png"
     plt.savefig(output_filename, dpi=300, bbox_inches="tight")
     plt.show()
+    plt.close(fig)
+
+    # ----------------------------------------------------
+    # 4. FOCUS-LOAN MONTHLY PAYMENT CHART
+    # ----------------------------------------------------
+    focus_df = pd.DataFrame(focus_payment_history)
+
+    fig2, ax2 = plt.subplots(figsize=(14, 6))
+
+    bar_colors = [
+        get_loan_color(name) for name in focus_df["Loan Name"]
+    ]
+    ax2.bar(
+        focus_df["Month"],
+        focus_df["Payment"],
+        color=bar_colors,
+        width=1.0,
+        edgecolor="none",
+    )
+
+    # Label each contiguous block of months spent focused on the same
+    # loan, once, roughly centered over that block.
+    focus_df["block"] = (
+        focus_df["Loan Name"] != focus_df["Loan Name"].shift()
+    ).cumsum()
+    for _, block_df in focus_df.groupby("block"):
+        loan_name = block_df["Loan Name"].iloc[0]
+        rank = priority_map[loan_name]
+        mid_month = block_df["Month"].mean()
+        max_payment = block_df["Payment"].max()
+        ax2.annotate(
+            f"#{rank}: {loan_name}",
+            xy=(mid_month, max_payment),
+            xytext=(0, 6),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            rotation=90 if len(block_df) < 3 else 0,
+        )
+
+    ax2.set_title(
+        "Monthly Payment to Current Focus Loan\n"
+        f"(Minimum + Extra Applied to Whichever Loan is Top Priority That Month | Strategy: {strategy_desc})",
+        fontsize=11,
+        fontweight="bold",
+        pad=15,
+    )
+    ax2.set_xlabel("Time (Months)", fontsize=11)
+    ax2.set_ylabel("Payment to Focus Loan ($)", fontsize=11)
+    ax2.yaxis.set_major_formatter(ticker.StrMethodFormatter("${x:,.0f}"))
+    ax2.grid(True, linestyle="--", alpha=0.4, axis="y")
+
+    plt.tight_layout()
+    focus_output_filename = "focus_loan_payment_chart.png"
+    plt.savefig(focus_output_filename, dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close(fig2)
 
 
 if __name__ == "__main__":
